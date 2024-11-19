@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import List
 
+import torch
 import torch.nn as nn
 from mmcv.cnn import ConvModule, DepthwiseSeparableConvModule
 from mmdet.models.backbones.csp_darknet import CSPLayer
@@ -9,30 +10,8 @@ from mmdet.utils import ConfigType, OptMultiConfig
 from mmyolo.registry import MODELS
 from .base_yolo_neck import BaseYOLONeck
 
-
 @MODELS.register_module()
 class YOLOXPAFPN(BaseYOLONeck):
-    """Path Aggregation Network used in YOLOX.
-
-    Args:
-        in_channels (List[int]): Number of input channels per scale.
-        out_channels (int): Number of output channels (used at each scale).
-        deepen_factor (float): Depth multiplier, multiply number of
-            blocks in CSP layer by this amount. Defaults to 1.0.
-        widen_factor (float): Width multiplier, multiply number of
-            channels in each layer by this amount. Defaults to 1.0.
-        num_csp_blocks (int): Number of bottlenecks in CSPLayer. Defaults to 1.
-        use_depthwise (bool): Whether to use depthwise separable convolution.
-            Defaults to False.
-        freeze_all(bool): Whether to freeze the model. Defaults to False.
-        norm_cfg (dict): Config dict for normalization layer.
-            Defaults to dict(type='BN', momentum=0.03, eps=0.001).
-        act_cfg (dict): Config dict for activation layer.
-            Defaults to dict(type='SiLU', inplace=True).
-        init_cfg (dict or list[dict], optional): Initialization config dict.
-            Defaults to None.
-    """
-
     def __init__(self,
                  in_channels: List[int],
                  out_channels: int,

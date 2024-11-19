@@ -2,6 +2,7 @@
 from abc import ABCMeta, abstractmethod
 from typing import List, Union
 
+import cv2
 import torch
 import torch.nn as nn
 from mmdet.utils import ConfigType, OptMultiConfig
@@ -9,127 +10,14 @@ from mmengine.model import BaseModule
 from torch.nn.modules.batchnorm import _BatchNorm
 
 from mmyolo.registry import MODELS
-
+from mmcv.cnn import build_activation_layer
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
 
 @MODELS.register_module()
 class BaseYOLONeck(BaseModule, metaclass=ABCMeta):
-    """Base neck used in YOLO series.
 
-    .. code:: text
-
-     P5 neck model structure diagram
-                        +--------+                     +-------+
-                        |top_down|----------+--------->|  out  |---> output0
-                        | layer1 |          |          | layer0|
-                        +--------+          |          +-------+
-     stride=8                ^              |
-     idx=0  +------+    +--------+          |
-     -----> |reduce|--->|   cat  |          |
-            |layer0|    +--------+          |
-            +------+         ^              v
-                        +--------+    +-----------+
-                        |upsample|    |downsample |
-                        | layer1 |    |  layer0   |
-                        +--------+    +-----------+
-                             ^              |
-                        +--------+          v
-                        |top_down|    +-----------+
-                        | layer2 |--->|    cat    |
-                        +--------+    +-----------+
-     stride=16               ^              v
-     idx=1  +------+    +--------+    +-----------+    +-------+
-     -----> |reduce|--->|   cat  |    | bottom_up |--->|  out  |---> output1
-            |layer1|    +--------+    |   layer0  |    | layer1|
-            +------+         ^        +-----------+    +-------+
-                             |              v
-                        +--------+    +-----------+
-                        |upsample|    |downsample |
-                        | layer2 |    |  layer1   |
-     stride=32          +--------+    +-----------+
-     idx=2  +------+         ^              v
-     -----> |reduce|         |        +-----------+
-            |layer2|---------+------->|    cat    |
-            +------+                  +-----------+
-                                            v
-                                      +-----------+    +-------+
-                                      | bottom_up |--->|  out  |---> output2
-                                      |  layer1   |    | layer2|
-                                      +-----------+    +-------+
-
-    .. code:: text
-
-     P6 neck model structure diagram
-                        +--------+                     +-------+
-                        |top_down|----------+--------->|  out  |---> output0
-                        | layer1 |          |          | layer0|
-                        +--------+          |          +-------+
-     stride=8                ^              |
-     idx=0  +------+    +--------+          |
-     -----> |reduce|--->|   cat  |          |
-            |layer0|    +--------+          |
-            +------+         ^              v
-                        +--------+    +-----------+
-                        |upsample|    |downsample |
-                        | layer1 |    |  layer0   |
-                        +--------+    +-----------+
-                             ^              |
-                        +--------+          v
-                        |top_down|    +-----------+
-                        | layer2 |--->|    cat    |
-                        +--------+    +-----------+
-     stride=16               ^              v
-     idx=1  +------+    +--------+    +-----------+    +-------+
-     -----> |reduce|--->|   cat  |    | bottom_up |--->|  out  |---> output1
-            |layer1|    +--------+    |   layer0  |    | layer1|
-            +------+         ^        +-----------+    +-------+
-                             |              v
-                        +--------+    +-----------+
-                        |upsample|    |downsample |
-                        | layer2 |    |  layer1   |
-                        +--------+    +-----------+
-                             ^              |
-                        +--------+          v
-                        |top_down|    +-----------+
-                        | layer3 |--->|    cat    |
-                        +--------+    +-----------+
-     stride=32               ^              v
-     idx=2  +------+    +--------+    +-----------+    +-------+
-     -----> |reduce|--->|   cat  |    | bottom_up |--->|  out  |---> output2
-            |layer2|    +--------+    |   layer1  |    | layer2|
-            +------+         ^        +-----------+    +-------+
-                             |              v
-                        +--------+    +-----------+
-                        |upsample|    |downsample |
-                        | layer3 |    |  layer2   |
-                        +--------+    +-----------+
-     stride=64               ^              v
-     idx=3  +------+         |        +-----------+
-     -----> |reduce|---------+------->|    cat    |
-            |layer3|                  +-----------+
-            +------+                        v
-                                      +-----------+    +-------+
-                                      | bottom_up |--->|  out  |---> output3
-                                      |  layer2   |    | layer3|
-                                      +-----------+    +-------+
-
-    Args:
-        in_channels (List[int]): Number of input channels per scale.
-        out_channels (int): Number of output channels (used at each scale)
-        deepen_factor (float): Depth multiplier, multiply number of
-            blocks in CSP layer by this amount. Defaults to 1.0.
-        widen_factor (float): Width multiplier, multiply number of
-            channels in each layer by this amount. Defaults to 1.0.
-        upsample_feats_cat_first (bool): Whether the output features are
-            concat first after upsampling in the topdown module.
-            Defaults to True. Currently only YOLOv7 is false.
-        freeze_all(bool): Whether to freeze the model. Defaults to False
-        norm_cfg (dict): Config dict for normalization layer.
-            Defaults to None.
-        act_cfg (dict): Config dict for activation layer.
-            Defaults to None.
-        init_cfg (dict or list[dict], optional): Initialization config dict.
-            Defaults to None.
-    """
 
     def __init__(self,
                  in_channels: List[int],
@@ -173,6 +61,22 @@ class BaseYOLONeck(BaseModule, metaclass=ABCMeta):
         self.out_layers = nn.ModuleList()
         for idx in range(len(in_channels)):
             self.out_layers.append(self.build_out_layer(idx))
+
+        self.scale_aware1 = nn.Sequential(
+        nn.AdaptiveAvgPool2d(1), nn.Conv2d(128, 1, 1),
+        nn.ReLU(inplace=True), build_activation_layer(dict(type='HSigmoid', bias=3.0, divisor=6.0)))
+        self.scale_aware2 = nn.Sequential(
+        nn.AdaptiveAvgPool2d(1), nn.Conv2d(256, 1, 1),
+        nn.ReLU(inplace=True), build_activation_layer(dict(type='HSigmoid', bias=3.0, divisor=6.0)))            
+
+        self.scale_aware3 = nn.Sequential(
+        nn.AdaptiveAvgPool2d(1), nn.Conv2d(512, 1, 1),
+        nn.ReLU(inplace=True), build_activation_layer(dict(type='HSigmoid', bias=3.0, divisor=6.0)))
+
+        self.norm1=nn.BatchNorm2d(128)
+        self.norm2=nn.BatchNorm2d(256)
+
+        self.norm3=nn.BatchNorm2d(512)
 
     @abstractmethod
     def build_reduce_layer(self, idx: int):
@@ -222,7 +126,42 @@ class BaseYOLONeck(BaseModule, metaclass=ABCMeta):
     def forward(self, inputs: List[torch.Tensor]) -> tuple:
         """Forward function."""
         assert len(inputs) == len(self.in_channels)
-        # reduce layers
+        inputs=list(inputs)
+
+        # # for idx, i in enumerate(inputs):
+        for idx,i in enumerate(inputs):
+
+             if idx == 0:
+                # The first scale-aware processing and residual connection
+                scale_aware_output = self.scale_aware1(inputs[idx])
+                inputs[idx] = scale_aware_output * inputs[idx] + inputs[idx]
+                inputs[idx]=self.norm1(inputs[idx])
+                # # The second scale-aware processing and residual connection
+                # scale_aware_output = self.scale_aware1(inputs[idx])
+                # inputs[idx] = scale_aware_output * inputs[idx] + inputs[idx]
+
+             elif idx == 1:
+                # The first scale-aware processing and residual connection
+                scale_aware_output = self.scale_aware2(inputs[idx])
+                inputs[idx] = scale_aware_output * inputs[idx] + inputs[idx]
+                inputs[idx]=self.norm2(inputs[idx])
+                # # The second scale-aware processing and residual connection
+                # scale_aware_output = self.scale_aware2(inputs[idx])
+                # inputs[idx] = scale_aware_output * inputs[idx] + inputs[idx]
+        
+    
+             elif idx == 2:
+                # The first scale-aware processing and residual connection
+                scale_aware_output = self.scale_aware3(inputs[idx])
+                inputs[idx] = scale_aware_output * inputs[idx] + inputs[idx]
+                inputs[idx]=self.norm3(inputs[idx])
+                # # The second scale-aware processing and residual connection
+                # scale_aware_output = self.scale_aware3(inputs[idx])
+                # inputs[idx] = scale_aware_output * inputs[idx] + inputs[idx]
+
+
+
+        inputs=tuple(inputs)
         reduce_outs = []
         for idx in range(len(self.in_channels)):
             reduce_outs.append(self.reduce_layers[idx](inputs[idx]))

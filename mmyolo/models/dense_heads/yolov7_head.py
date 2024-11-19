@@ -16,7 +16,52 @@ from ..layers import ImplicitA, ImplicitM
 from ..task_modules.assigners.batch_yolov7_assigner import BatchYOLOv7Assigner
 from .yolov5_head import YOLOv5Head, YOLOv5HeadModule
 
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        
+        self.sigmoid = nn.Sigmoid()
 
+    def forward(self, x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+    
+# 定义SpatialAttention类
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+# 定义CBAM类
+class CBAM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        x = x * self.ca(x)
+        x = x * self.sa(x)
+        return x
 @MODELS.register_module()
 class YOLOv7HeadModule(YOLOv5HeadModule):
     """YOLOv7Head head module used in YOLOv7."""
@@ -79,6 +124,22 @@ class YOLOv7p6HeadModule(YOLOv5HeadModule):
                     padding=1,
                     norm_cfg=self.norm_cfg,
                     act_cfg=self.act_cfg),
+                nn.ConvTranspose2d(
+                    self.main_out_channels[i],
+                    self.main_out_channels[i],
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    output_padding=0,
+                    bias=False),
+                CBAM(self.main_out_channels[i]),
+                nn.Conv2d(
+                    self.main_out_channels[i],
+                    self.main_out_channels[i],
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    bias=False),
                 ImplicitA(self.main_out_channels[i]),
                 nn.Conv2d(self.main_out_channels[i],
                           self.num_base_priors * self.num_out_attrib, 1),

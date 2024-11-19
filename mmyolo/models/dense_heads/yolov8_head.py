@@ -1,7 +1,11 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from functools import partial
 import math
+import cv2
 from typing import List, Sequence, Tuple, Union
-
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
 import torch
 import torch.nn as nn
 from mmcv.cnn import ConvModule
@@ -16,6 +20,98 @@ from torch import Tensor
 from mmyolo.registry import MODELS, TASK_UTILS
 from ..utils import gt_instances_preprocess, make_divisible
 from .yolov5_head import YOLOv5Head
+
+# def normalize(tensor):
+#     tensor = tensor - tensor.min()
+#     tensor = tensor / tensor.max()
+#     return tensor
+
+# def feature_to_rgb(feature_map):
+#     # Reshape to (channels, height*width)
+#     reshaped = feature_map.view(feature_map.size(0), -1).t()
+#     reshaped = reshaped.cpu().numpy()  # Move to CPU and convert to numpy
+    
+#     # Ensure there are enough samples for PCA
+#     n_samples, n_features = reshaped.shape
+#     if n_samples < 3:
+#         raise ValueError(f"n_samples={n_samples} is too small for n_components=3 PCA.")
+    
+#     # Apply PCA to reduce to 3 components
+#     pca = PCA(n_components=3)
+#     reduced = pca.fit_transform(reshaped)
+    
+#     # Normalize each channel to [0, 1]
+#     reduced = (reduced - reduced.min(axis=0)) / (reduced.max(axis=0) - reduced.min(axis=0))
+    
+#     # Reshape back to (height, width, 3)
+#     height, width = feature_map.size(1), feature_map.size(2)
+#     rgb_image = reduced.reshape(height, width, 3)
+#     return rgb_image
+
+# def visualize_feature_maps(features):
+#     images = []
+#     for i, feature in enumerate(features):
+#         feature = normalize(feature)
+#         rgb_image = feature_to_rgb(feature)
+#         plt.figure(figsize=(8, 8))
+#         plt.title(f"Feature Map {i+1}")
+#         plt.imshow(rgb_image)
+#         plt.axis('off')
+#         plt.show()
+#         images.append(rgb_image)
+#     return images
+
+# def multi_apply(func, *args, **kwargs):
+#     pfunc = partial(func, **kwargs) if kwargs else func
+#     map_results = map(pfunc, *args)
+#     return tuple(map(list, zip(*map_results)))
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+    
+
+# 定义SpatialAttention类
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+# 定义CBAM类
+class CBAM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        x = x * self.ca(x)
+        x = x * self.sa(x)
+        return x
 
 
 @MODELS.register_module()
@@ -104,6 +200,23 @@ class YOLOv8HeadModule(BaseModule):
                         padding=1,
                         norm_cfg=self.norm_cfg,
                         act_cfg=self.act_cfg),
+                #     nn.ConvTranspose2d(
+                #         in_channels=reg_out_channels,
+                #         out_channels=reg_out_channels,
+                #         kernel_size=3,
+                #         stride=1,
+                #         padding=1,
+                #         output_padding=0,
+                #         bias=False
+                #     ),
+                #     nn.Conv2d(
+                #         in_channels=reg_out_channels,
+                #         out_channels=reg_out_channels,
+                #         kernel_size=3,
+                #         stride=1,
+                #         padding=1,
+                #         bias=False
+                # ),
                     ConvModule(
                         in_channels=reg_out_channels,
                         out_channels=reg_out_channels,
@@ -126,6 +239,7 @@ class YOLOv8HeadModule(BaseModule):
                         padding=1,
                         norm_cfg=self.norm_cfg,
                         act_cfg=self.act_cfg),
+                    CBAM(cls_out_channels),
                     ConvModule(
                         in_channels=cls_out_channels,
                         out_channels=cls_out_channels,
@@ -152,9 +266,20 @@ class YOLOv8HeadModule(BaseModule):
             Tuple[List]: A tuple of multi-level classification scores, bbox
             predictions
         """
+
         assert len(x) == self.num_levels
+        # for level, feature in enumerate(x):
+        #     feature_maps = [feature]
+        #     try:
+        #         visualize_feature_maps(feature_maps)
+        #         for i, img in enumerate(visualize_feature_maps(feature_maps)):
+        #             img = (img * 255).astype(np.uint8)  # Convert to uint8 for saving
+        #             cv2.imwrite(f'可视化结果/可视化结果3/level_{level}_feature_{i}.png', img)
+        #     except ValueError as e:
+        #         print(f"Skipping visualization for level {level} due to error: {e}")
         return multi_apply(self.forward_single, x, self.cls_preds,
                            self.reg_preds)
+
 
     def forward_single(self, x: torch.Tensor, cls_pred: nn.ModuleList,
                        reg_pred: nn.ModuleList) -> Tuple:

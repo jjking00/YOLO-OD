@@ -215,11 +215,16 @@ class BaseBackbone(BaseModule, metaclass=ABCMeta):
 
     def forward(self, x: torch.Tensor) -> tuple:
         """Forward batch_inputs from the data_preprocessor."""
+        #add
+        # x_ori=x
         outs = []
         for i, layer_name in enumerate(self.layers):
             layer = getattr(self, layer_name)
             x = layer(x)
             if i in self.out_indices:
                 outs.append(x)
+
+        #add
+        # outs.append(x_ori)
 
         return tuple(outs)

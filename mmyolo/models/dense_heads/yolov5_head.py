@@ -30,7 +30,53 @@ def get_prior_xy_info(index: int, num_base_priors: int,
     grid_y = xy_index // featmap_w
     grid_x = xy_index % featmap_w
     return priors, grid_x, grid_y
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        
+        self.sigmoid = nn.Sigmoid()
 
+    def forward(self, x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+    
+
+# 定义SpatialAttention类
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+# 定义CBAM类
+class CBAM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        x = x * self.ca(x)
+        x = x * self.sa(x)
+        return x
 
 @MODELS.register_module()
 class YOLOv5HeadModule(BaseModule):
@@ -82,17 +128,41 @@ class YOLOv5HeadModule(BaseModule):
         """initialize conv layers in YOLOv5 head."""
         self.convs_pred = nn.ModuleList()
         for i in range(self.num_levels):
-            conv_pred = nn.Conv2d(self.in_channels[i],
-                                  self.num_base_priors * self.num_out_attrib,
-                                  1)
-
+            # Define a sequential container with Conv2d, ConvTranspose2d, and another Conv2d
+            # 改动1: 使用 Sequential 容器插入 Conv2d, ConvTranspose2d, 和另一个 Conv2d
+            conv_pred = nn.Sequential(
+                nn.Conv2d(
+                    self.in_channels[i],
+                    self.num_base_priors * self.num_out_attrib,
+                    1
+                ),
+                nn.ConvTranspose2d(
+                    self.num_base_priors * self.num_out_attrib,
+                    self.num_base_priors * self.num_out_attrib,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    output_padding=0,
+                    bias=False
+                ),
+                CBAM(self.num_base_priors * self.num_out_attrib),
+                nn.Conv2d(
+                    self.num_base_priors * self.num_out_attrib,
+                    self.num_base_priors * self.num_out_attrib,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    bias=False
+                )
+            )
             self.convs_pred.append(conv_pred)
 
     def init_weights(self):
         """Initialize the bias of YOLOv5 head."""
         super().init_weights()
         for mi, s in zip(self.convs_pred, self.featmap_strides):  # from
-            b = mi.bias.data.view(self.num_base_priors, -1)
+            b = mi[0].bias.data.view(self.num_base_priors, -1)
+            # 改动2: 初始化第一个 Conv2d 的偏置
             # obj (8 objects per 640 image)
             b.data[:, 4] += math.log(8 / (640 / s)**2)
             # NOTE: The following initialization can only be performed on the
@@ -102,7 +172,8 @@ class YOLOv5HeadModule(BaseModule):
             b.data[:, 5:5 + self.num_classes] += math.log(
                 0.6 / (self.num_classes - 0.999999))
 
-            mi.bias.data = b.view(-1)
+            mi[0].bias.data = b.view(-1)
+            # 改动3: 将偏置设置回第一个 Conv2d
 
     def forward(self, x: Tuple[Tensor]) -> Tuple[List]:
         """Forward features from the upstream network.

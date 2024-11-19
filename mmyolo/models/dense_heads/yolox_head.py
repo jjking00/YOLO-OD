@@ -17,44 +17,52 @@ from torch import Tensor
 from mmyolo.registry import MODELS, TASK_UTILS
 from .yolov5_head import YOLOv5Head
 
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        
+        self.sigmoid = nn.Sigmoid()
 
+    def forward(self, x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+class CBAM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        x = x * self.ca(x)
+        x = x * self.sa(x)
+        return x
 @MODELS.register_module()
 class YOLOXHeadModule(BaseModule):
-    """YOLOXHead head module used in `YOLOX.
-
-    `<https://arxiv.org/abs/2107.08430>`_
-
-    Args:
-        num_classes (int): Number of categories excluding the background
-            category.
-        in_channels (Union[int, Sequence]): Number of channels in the input
-            feature map.
-        widen_factor (float): Width multiplier, multiply number of
-            channels in each layer by this amount. Defaults to 1.0.
-        num_base_priors (int): The number of priors (points) at a point
-            on the feature grid
-        stacked_convs (int): Number of stacking convs of the head.
-            Defaults to 2.
-        featmap_strides (Sequence[int]): Downsample factor of each feature map.
-             Defaults to [8, 16, 32].
-        use_depthwise (bool): Whether to depthwise separable convolution in
-            blocks. Defaults to False.
-        dcn_on_last_conv (bool): If true, use dcn in the last layer of
-            towers. Defaults to False.
-        conv_bias (bool or str): If specified as `auto`, it will be decided by
-            the norm_cfg. Bias of conv will be set as True if `norm_cfg` is
-            None, otherwise False. Defaults to "auto".
-        conv_cfg (:obj:`ConfigDict` or dict, optional): Config dict for
-            convolution layer. Defaults to None.
-        norm_cfg (:obj:`ConfigDict` or dict): Config dict for normalization
-            layer. Defaults to dict(type='BN', momentum=0.03, eps=0.001).
-        act_cfg (:obj:`ConfigDict` or dict): Config dict for activation layer.
-            Defaults to None.
-        init_cfg (:obj:`ConfigDict` or list[:obj:`ConfigDict`] or dict or
-            list[dict], optional): Initialization config dict.
-            Defaults to None.
-    """
-
     def __init__(
         self,
         num_classes: int,
@@ -101,17 +109,17 @@ class YOLOXHeadModule(BaseModule):
         self.multi_level_conv_reg = nn.ModuleList()
         self.multi_level_conv_obj = nn.ModuleList()
         for _ in self.featmap_strides:
-            self.multi_level_cls_convs.append(self._build_stacked_convs())
-            self.multi_level_reg_convs.append(self._build_stacked_convs())
+            self.multi_level_cls_convs.append(self._build_stacked_convs(add_cbam=True))
+            # Modified: add_deconv_and_conv=True for regression head
+            self.multi_level_reg_convs.append(self._build_stacked_convs(add_deconv_and_conv=True))
             conv_cls, conv_reg, conv_obj = self._build_predictor()
             self.multi_level_conv_cls.append(conv_cls)
             self.multi_level_conv_reg.append(conv_reg)
             self.multi_level_conv_obj.append(conv_obj)
 
-    def _build_stacked_convs(self) -> nn.Sequential:
+    def _build_stacked_convs(self, add_cbam=False, add_deconv_and_conv=False) -> nn.Sequential:
         """Initialize conv layers of a single level head."""
-        conv = DepthwiseSeparableConvModule \
-            if self.use_depthwise else ConvModule
+        conv = DepthwiseSeparableConvModule if self.use_depthwise else ConvModule
         stacked_convs = []
         for i in range(self.stacked_convs):
             chn = self.in_channels if i == 0 else self.feat_channels
@@ -130,6 +138,13 @@ class YOLOXHeadModule(BaseModule):
                     norm_cfg=self.norm_cfg,
                     act_cfg=self.act_cfg,
                     bias=self.conv_bias))
+        if add_cbam:
+            # Added: CBAM module at the end of the stacked convolutions
+            stacked_convs.append(CBAM(self.feat_channels))
+        if add_deconv_and_conv:
+            # Added: Deconv layer followed by a Conv layer for regression head
+            stacked_convs.append(nn.ConvTranspose2d(self.feat_channels, self.feat_channels, 3, stride=1, padding=1))
+            stacked_convs.append(nn.Conv2d(self.feat_channels, self.feat_channels, 3, stride=1, padding=1))
         return nn.Sequential(*stacked_convs)
 
     def _build_predictor(self) -> Tuple[nn.Module, nn.Module, nn.Module]:
@@ -141,11 +156,9 @@ class YOLOXHeadModule(BaseModule):
 
     def init_weights(self):
         """Initialize weights of the head."""
-        # Use prior in model initialization to improve stability
         super().init_weights()
         bias_init = bias_init_with_prob(0.01)
-        for conv_cls, conv_obj in zip(self.multi_level_conv_cls,
-                                      self.multi_level_conv_obj):
+        for conv_cls, conv_obj in zip(self.multi_level_conv_cls, self.multi_level_conv_obj):
             conv_cls.bias.data.fill_(bias_init)
             conv_obj.bias.data.fill_(bias_init)
 
@@ -159,49 +172,21 @@ class YOLOXHeadModule(BaseModule):
             Tuple[List]: A tuple of multi-level classification scores, bbox
             predictions, and objectnesses.
         """
+        return multi_apply(self.forward_single, x, self.multi_level_cls_convs, self.multi_level_reg_convs,
+                           self.multi_level_conv_cls, self.multi_level_conv_reg, self.multi_level_conv_obj)
 
-        return multi_apply(self.forward_single, x, self.multi_level_cls_convs,
-                           self.multi_level_reg_convs,
-                           self.multi_level_conv_cls,
-                           self.multi_level_conv_reg,
-                           self.multi_level_conv_obj)
-
-    def forward_single(self, x: Tensor, cls_convs: nn.Module,
-                       reg_convs: nn.Module, conv_cls: nn.Module,
-                       conv_reg: nn.Module,
-                       conv_obj: nn.Module) -> Tuple[Tensor, Tensor, Tensor]:
+    def forward_single(self, x: Tensor, cls_convs: nn.Module, reg_convs: nn.Module, conv_cls: nn.Module,
+                       conv_reg: nn.Module, conv_obj: nn.Module) -> Tuple[Tensor, Tensor, Tensor]:
         """Forward feature of a single scale level."""
-
         cls_feat = cls_convs(x)
         reg_feat = reg_convs(x)
-
         cls_score = conv_cls(cls_feat)
         bbox_pred = conv_reg(reg_feat)
         objectness = conv_obj(reg_feat)
-
         return cls_score, bbox_pred, objectness
-
 
 @MODELS.register_module()
 class YOLOXHead(YOLOv5Head):
-    """YOLOXHead head used in `YOLOX <https://arxiv.org/abs/2107.08430>`_.
-
-    Args:
-        head_module(ConfigType): Base module used for YOLOXHead
-        prior_generator: Points generator feature maps in
-            2D points-based detectors.
-        loss_cls (:obj:`ConfigDict` or dict): Config of classification loss.
-        loss_bbox (:obj:`ConfigDict` or dict): Config of localization loss.
-        loss_obj (:obj:`ConfigDict` or dict): Config of objectness loss.
-        loss_bbox_aux (:obj:`ConfigDict` or dict): Config of bbox aux loss.
-        train_cfg (:obj:`ConfigDict` or dict, optional): Training config of
-            anchor head. Defaults to None.
-        test_cfg (:obj:`ConfigDict` or dict, optional): Testing config of
-            anchor head. Defaults to None.
-        init_cfg (:obj:`ConfigDict` or list[:obj:`ConfigDict`] or dict or
-            list[dict], optional): Initialization config dict.
-            Defaults to None.
-    """
 
     def __init__(self,
                  head_module: ConfigType,
